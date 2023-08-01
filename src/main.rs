@@ -1,19 +1,28 @@
-use std::{collections::HashMap, error::Error};
+use std::{
+    collections::VecDeque,
+    error::Error,
+    fs::{File, Permissions},
+    io::{Read, Write},
+    mem::take,
+    os::unix::prelude::PermissionsExt,
+    sync::mpsc::{self, Receiver, Sender},
+    thread,
+};
 use wayland_client::{
     globals::Global,
-    protocol::{wl_output, wl_registry},
+    protocol::{__interfaces::WL_OUTPUT_INTERFACE, wl_output, wl_registry},
     Connection, Dispatch, DispatchError, EventQueue, QueueHandle,
 };
-use wayland_protocols_wlr::export_dmabuf::v1::client::{
-    zwlr_export_dmabuf_frame_v1::{self, ZwlrExportDmabufFrameV1},
-    zwlr_export_dmabuf_manager_v1::{self, ZwlrExportDmabufManagerV1},
+use wayland_protocols_wlr::{
+    export_dmabuf::v1::client::zwlr_export_dmabuf_frame_v1::{self, ZwlrExportDmabufFrameV1},
+    screencopy::v1::client::{
+        __interfaces::ZWLR_SCREENCOPY_FRAME_V1_INTERFACE,
+        zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1,
+        zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
+    },
 };
-// use wayland_protocols_wlr::export_dmabuf::v1::client::zwlr_export_dmabuf_manager_v1;
 
-const EXPORT_DMABUF_INTERFACE_NAME: &str = "zwlr_export_dmabuf_manager_v1";
-const OUTPUT_INTERFACE_NAME: &str = "wl_output";
-
-type FrameEventVec = Vec<zwlr_export_dmabuf_frame_v1::Event>;
+type FrameEventVec = VecDeque<zwlr_export_dmabuf_frame_v1::Event>;
 
 #[derive(Debug, Default)]
 struct Capturer {
@@ -23,39 +32,73 @@ struct Capturer {
 }
 
 impl Capturer {
-    fn insert(&mut self, event: zwlr_export_dmabuf_frame_v1::Event) {
+    pub fn insert(&mut self, event: zwlr_export_dmabuf_frame_v1::Event) {
         use zwlr_export_dmabuf_frame_v1::Event as FrameEvent;
-        let mut frame_data = Self::default();
         match event {
-            FrameEvent::Frame { .. } => frame_data.frame.push(event),
-            FrameEvent::Object { .. } => frame_data.objects.push(event),
+            FrameEvent::Frame { .. } => self.frame.push_back(event),
+            FrameEvent::Object { .. } => {
+                self.objects.push_back(event);
+            }
             FrameEvent::Ready { .. } => {
-                frame_data.ready = Some(event);
+                self.ready = Some(event);
             }
             FrameEvent::Cancel { .. } => {
-                frame_data.frame.clear();
-                frame_data.objects.clear();
+                self.frame.clear();
+                self.objects.clear();
             }
             _ => {}
         }
     }
-    // fn start_capture()
+    fn do_capture(
+        mut self,
+        rx: Receiver<zwlr_export_dmabuf_frame_v1::Event>,
+    ) -> Result<(), Box<dyn Error>> {
+        use zwlr_export_dmabuf_frame_v1::Event;
+        let mut f = File::create("./capture.out")?;
+        let mut buf = Box::new([0u8; 1920 * 1080 * 10]);
+        while self.objects.len() > 0 {
+            if let Some(Event::Object { fd, .. }) = self.objects.pop_back() {
+                let mut reader: File = From::from(fd);
+                let reader_perms = Permissions::from_mode(7u32);
+                reader.set_permissions(reader_perms)?;
+
+                loop {
+                    let event_recieved = rx.try_recv();
+                    if let Ok(event) = event_recieved {
+                        if let Event::Cancel { reason } = event {
+                            dbg!("Capture Canceled: {}", reason);
+                            break;
+                        }
+                    }
+                    reader.read(&mut *buf)?;
+                    f.write_all(&*buf)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    pub fn start_capture(self) -> Sender<zwlr_export_dmabuf_frame_v1::Event> {
+        let (tx, rx) = mpsc::channel();
+        let _ = thread::Builder::new()
+            .stack_size(1024 * 1024 * 100)
+            .spawn(|| self.do_capture(rx).expect("Failed to write"));
+        return tx;
+    }
 }
 
 #[derive(Debug, Default)]
 struct AppData {
-    globals_list: HashMap<u32, Global>,
-    capturer: Option<Capturer>,
+    globals_list: Vec<Global>,
+    capturer: Option<Box<Capturer>>,
 }
 
 impl AppData {
-    pub fn get_global_by_interface<'a, 'b>(&self, interface: &str) -> Option<Global> {
-        let global = self
-            .globals_list
+    pub fn get_global_by_interface<'a, 'b>(&self, interface: &str) -> Vec<Global> {
+        self.globals_list
             .iter()
-            .find(|global| global.1.interface == interface)?
-            .1;
-        Some(global.clone())
+            .filter(|global| global.interface == interface)
+            .map(|gobal_ref| gobal_ref.clone())
+            .collect()
     }
 }
 
@@ -74,17 +117,20 @@ impl Dispatch<wl_registry::WlRegistry, ()> for AppData {
                 interface,
                 version,
             } => {
-                state.globals_list.insert(
+                state.globals_list.push(Global {
                     name,
-                    Global {
-                        name,
-                        interface,
-                        version,
-                    },
-                );
+                    interface,
+                    version,
+                });
             }
             wl_registry::Event::GlobalRemove { name } => {
-                state.globals_list.remove(&name);
+                let Some(index) = state
+                    .globals_list
+                    .iter()
+                    .position(|global| global.name == name) else {
+                    return;
+                };
+                state.globals_list.swap_remove(index);
             }
             _ => panic!("unknown event recieved when binding handling dispatch"),
         }
@@ -95,21 +141,25 @@ impl Dispatch<wl_output::WlOutput, ()> for AppData {
     fn event(
         _state: &mut Self,
         _: &wl_output::WlOutput,
-        _event: wl_output::Event,
+        event: wl_output::Event,
         _: &(),
         _: &Connection,
         _qh: &QueueHandle<AppData>,
     ) {
+        match event {
+            wl_output::Event::Name { name } => println!("{name}"),
+            _ => (),
+        }
     }
 }
-impl Dispatch<ZwlrExportDmabufManagerV1, ()> for AppData {
+impl Dispatch<ZwlrScreencopyManagerV1, ()> for AppData {
     fn event(
         _state: &mut Self,
-        _: &ZwlrExportDmabufManagerV1,
-        _event: zwlr_export_dmabuf_manager_v1::Event,
-        _: &(),
-        _: &Connection,
-        _qh: &QueueHandle<AppData>,
+        _proxy: &ZwlrScreencopyManagerV1,
+        _event: <ZwlrScreencopyManagerV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
     ) {
     }
 }
@@ -122,11 +172,33 @@ impl Dispatch<ZwlrExportDmabufFrameV1, ()> for AppData {
         _: &Connection,
         _qh: &QueueHandle<AppData>,
     ) {
-        println!("{:#?}", event);
-        if let Some(capture_data) = &mut state.capturer {
-            capture_data.insert(event);
-        } else {
-        }
+        (|| -> Option<Sender<zwlr_export_dmabuf_frame_v1::Event>> {
+            println!("{:#?}", event);
+            if let None = state.capturer {
+                state.capturer = Some(Box::new(Capturer::default()))
+            }
+            let capture_data = state.capturer.as_mut().unwrap();
+            let is_ready_event = matches!(event, zwlr_export_dmabuf_frame_v1::Event::Ready { .. });
+            let _ = capture_data.insert(event);
+            if is_ready_event {
+                let tx = take(&mut state.capturer)?.start_capture();
+                Some(tx)
+            } else {
+                None
+            }
+        })();
+    }
+}
+impl Dispatch<ZwlrScreencopyFrameV1, ()> for AppData {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwlrScreencopyFrameV1,
+        _event: <ZwlrScreencopyFrameV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        // proxy.copy_with_damage()
     }
 }
 
@@ -152,25 +224,30 @@ fn main() -> Result<(), Box<dyn Error>> {
         display.get_registry(&qh, ())
     })?;
 
-    let output_obj = app_state
-        .get_global_by_interface(OUTPUT_INTERFACE_NAME)
-        .unwrap();
-    let export_dmabuf_obj = app_state
-        .get_global_by_interface(EXPORT_DMABUF_INTERFACE_NAME)
-        .unwrap();
+    let output_globals = app_state.get_global_by_interface(WL_OUTPUT_INTERFACE.name);
+    let screencopy_globals =
+        app_state.get_global_by_interface(ZWLR_SCREENCOPY_FRAME_V1_INTERFACE.name);
+    let screencopy_obj = screencopy_globals
+        .get(0)
+        .ok_or("protocol unavailable: export_dmabuf")?;
 
-    let output: wl_output::WlOutput = with_roundtrip(&mut event_queue, &mut app_state, || {
-        registry.bind(output_obj.name, output_obj.version, &qh, ())
-    })?;
-
-    let export_dmabuf_mgr: ZwlrExportDmabufManagerV1 =
+    let mut outputs = vec![];
+    for output_obj in output_globals {
+        let output: wl_output::WlOutput = with_roundtrip(&mut event_queue, &mut app_state, || {
+            registry.bind(output_obj.name, output_obj.version, &qh, ())
+        })?;
+        outputs.push(output);
+    }
+    let screencopy_mgr: ZwlrScreencopyManagerV1 =
         with_roundtrip(&mut event_queue, &mut app_state, || {
-            registry.bind(export_dmabuf_obj.name, export_dmabuf_obj.version, &qh, ())
+            registry.bind(screencopy_obj.name, screencopy_obj.version, &qh, ())
         })?;
 
-    with_roundtrip(&mut event_queue, &mut app_state, || {
-        export_dmabuf_mgr.capture_output(1, &output, &qh, ());
-    })?;
+    for output in &outputs {
+        with_roundtrip(&mut event_queue, &mut app_state, || {
+            screencopy_mgr.capture_output(1, output, &qh, ());
+        })?;
+    }
 
     loop {
         event_queue.blocking_dispatch(&mut app_state)?;
