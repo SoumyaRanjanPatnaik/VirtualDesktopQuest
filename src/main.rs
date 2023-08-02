@@ -1,16 +1,28 @@
+use derive_builder::Builder;
+use libc::{
+    c_char, c_void, ftruncate64, mmap64, munmap, shm_open, MAP_PRIVATE, O_CREAT, O_EXCL, O_RDONLY,
+    O_RDWR, O_WRONLY, PROT_EXEC, PROT_READ, PROT_WRITE,
+};
 use std::{
     collections::VecDeque,
     error::Error,
+    ffi::CString,
     fs::{File, Permissions},
     io::{Read, Write},
     mem::take,
-    os::unix::prelude::PermissionsExt,
+    ops::{Deref, DerefMut},
+    os::{fd::RawFd, unix::prelude::PermissionsExt},
+    path::PathBuf,
+    ptr::null_mut,
     sync::mpsc::{self, Receiver, Sender},
     thread,
 };
 use wayland_client::{
     globals::Global,
-    protocol::{__interfaces::WL_OUTPUT_INTERFACE, wl_output, wl_registry},
+    protocol::{
+        __interfaces::{WL_OUTPUT_INTERFACE, WL_SHM_INTERFACE},
+        wl_output, wl_registry, wl_shm, wl_shm_pool,
+    },
     Connection, Dispatch, DispatchError, EventQueue, QueueHandle,
 };
 use wayland_protocols_wlr::{
@@ -152,6 +164,18 @@ impl Dispatch<wl_output::WlOutput, ()> for AppData {
         }
     }
 }
+
+impl Dispatch<wl_shm::WlShm, ()> for AppData {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_shm::WlShm,
+        _event: <wl_shm::WlShm as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
 impl Dispatch<ZwlrScreencopyManagerV1, ()> for AppData {
     fn event(
         _state: &mut Self,
@@ -202,6 +226,18 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for AppData {
     }
 }
 
+impl Dispatch<wl_shm_pool::WlShmPool, ()> for AppData {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_shm_pool::WlShmPool,
+        _event: <wl_shm_pool::WlShmPool as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
 fn with_roundtrip<T, S>(
     event_queue: &mut EventQueue<S>,
     state: &mut S,
@@ -210,6 +246,146 @@ fn with_roundtrip<T, S>(
     let result = method();
     event_queue.roundtrip(state)?;
     Ok(result)
+}
+
+#[derive(Clone, Builder)]
+#[builder(build_fn(validate = "Self::validate"))]
+struct ShmFactory {
+    #[builder(setter(into))]
+    name: String,
+    size: usize,
+    #[builder(setter(strip_option, into))]
+    scope: Option<String>,
+    read: bool,
+    write: bool,
+    #[builder(default = "true")]
+    create: bool,
+    #[builder(default = "true")]
+    rw: bool,
+    exec: bool,
+    check_exists: bool,
+}
+
+impl ShmFactoryBuilder {
+    fn validate(&self) -> Result<(), String> {
+        if self.name == None {
+            Err(String::from("'name' is a required field"))
+        } else if self.size == None {
+            Err(String::from("'size' is a required field"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl ShmFactory {
+    fn create_shm_map(self) -> Option<SharedMemMap<'static>> {
+        let runtime_dir = std::env::vars().find(|var| var.0 == "XDG_RUNTIME_DIR")?.1;
+        let mut rd_path = PathBuf::from(&runtime_dir);
+        if let Some(scope_val) = self.scope {
+            rd_path = rd_path.join(scope_val);
+        }
+        rd_path = rd_path.join(self.name);
+        let shm_path: String = rd_path.to_string_lossy().to_string();
+        let shm_path_cstring = CString::new(shm_path).ok()?;
+        let shm_path_raw = shm_path_cstring.to_bytes_with_nul().as_ptr() as *const c_char;
+        let mut shm_flag: i32 = 0;
+        let mut mode = 0;
+
+        if self.create {
+            shm_flag = shm_flag | O_CREAT;
+        }
+        if self.write {
+            shm_flag = shm_flag | O_WRONLY;
+            mode += 200;
+        }
+        if self.read {
+            shm_flag = shm_flag | O_RDONLY;
+            mode += 400;
+        }
+        if self.rw {
+            shm_flag = shm_flag | O_RDWR;
+            mode = 600;
+        }
+        if self.exec {
+            mode += 100;
+        }
+        if self.check_exists {
+            shm_flag = shm_flag | O_EXCL;
+        }
+
+        let shm_fd_raw: RawFd = unsafe { shm_open(shm_path_raw, shm_flag, mode) };
+        let _is_error = unsafe {
+            let ret = ftruncate64(shm_fd_raw, self.size.try_into().ok()?);
+            ret == -1
+        };
+        let mut map_flags = 0;
+        if self.rw {
+            map_flags = map_flags | PROT_READ;
+            map_flags = map_flags | PROT_WRITE;
+        } else if self.read {
+            map_flags = map_flags | PROT_READ;
+        } else if self.write {
+            map_flags = map_flags | PROT_WRITE;
+        }
+        if self.exec {
+            map_flags = map_flags | PROT_EXEC;
+        }
+        let map_addr = unsafe {
+            mmap64(
+                null_mut(),
+                self.size as usize,
+                map_flags,
+                MAP_PRIVATE,
+                shm_fd_raw,
+                0,
+            )
+        };
+        let ptr = unsafe {
+            std::slice::from_raw_parts_mut(map_addr as *mut u8, self.size.try_into().ok()?)
+        };
+        Some(SharedMemMap {
+            fd: shm_fd_raw,
+            shm: ptr,
+            addr: map_addr,
+            size: self.size as usize,
+        })
+    }
+}
+
+struct SharedMemMap<'a> {
+    pub shm: &'a mut [u8],
+    addr: *mut c_void,
+    fd: RawFd,
+    size: usize,
+}
+
+impl SharedMemMap<'_> {
+    fn len(&self) -> usize {
+        self.size
+    }
+    fn fd(&self) -> RawFd {
+        self.fd
+    }
+}
+
+impl Deref for SharedMemMap<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        return self.shm;
+    }
+}
+
+impl DerefMut for SharedMemMap<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.shm
+    }
+}
+
+impl Drop for SharedMemMap<'_> {
+    fn drop(&mut self) {
+        unsafe { munmap(self.addr, self.size) };
+    }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -231,6 +407,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         .get(0)
         .ok_or("protocol unavailable: export_dmabuf")?;
 
+    let shm_globals = app_state.get_global_by_interface(WL_SHM_INTERFACE.name);
+    let shm_obj = shm_globals.get(0).ok_or("protocol unavailable: wl_shm")?;
+
     let mut outputs = vec![];
     for output_obj in output_globals {
         let output: wl_output::WlOutput = with_roundtrip(&mut event_queue, &mut app_state, || {
@@ -239,9 +418,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         outputs.push(output);
     }
     let screencopy_mgr: ZwlrScreencopyManagerV1 =
-        with_roundtrip(&mut event_queue, &mut app_state, || {
-            registry.bind(screencopy_obj.name, screencopy_obj.version, &qh, ())
-        })?;
+        registry.bind(screencopy_obj.name, screencopy_obj.version, &qh, ());
+
+    let shm_mgr: wl_shm::WlShm = with_roundtrip(&mut event_queue, &mut app_state, || {
+        registry.bind(shm_obj.name, shm_obj.version, &qh, ())
+    })?;
+
+    let shm_factory = ShmFactoryBuilder::default().rw(true).create(true).build()?;
+    let shm = shm_factory.create_shm_map().ok_or("Failed to create shm")?;
+    shm_mgr.create_pool(shm.fd(), shm.len().try_into()?, &qh, ());
 
     for output in &outputs {
         with_roundtrip(&mut event_queue, &mut app_state, || {
