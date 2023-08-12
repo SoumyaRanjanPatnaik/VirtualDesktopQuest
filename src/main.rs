@@ -1,15 +1,6 @@
 mod shm;
 use shm::ShmFactoryBuilder;
-use std::{
-    collections::VecDeque,
-    error::Error,
-    fs::{File, Permissions},
-    io::{Read, Write},
-    mem::take,
-    os::unix::prelude::PermissionsExt,
-    sync::mpsc::{self, Receiver, Sender},
-    thread,
-};
+use std::error::Error;
 use wayland_client::{
     globals::Global,
     protocol::{
@@ -18,83 +9,15 @@ use wayland_client::{
     },
     Connection, Dispatch, DispatchError, EventQueue, QueueHandle,
 };
-use wayland_protocols_wlr::{
-    export_dmabuf::v1::client::zwlr_export_dmabuf_frame_v1::{self, ZwlrExportDmabufFrameV1},
-    screencopy::v1::client::{
-        __interfaces::ZWLR_SCREENCOPY_MANAGER_V1_INTERFACE,
-        zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1,
-        zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
-    },
+use wayland_protocols_wlr::screencopy::v1::client::{
+    __interfaces::ZWLR_SCREENCOPY_MANAGER_V1_INTERFACE,
+    zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1,
+    zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
 };
-
-type FrameEventVec = VecDeque<zwlr_export_dmabuf_frame_v1::Event>;
-
-#[derive(Debug, Default)]
-struct Capturer {
-    frame: FrameEventVec,
-    objects: FrameEventVec,
-    ready: Option<zwlr_export_dmabuf_frame_v1::Event>,
-}
-
-impl Capturer {
-    pub fn insert(&mut self, event: zwlr_export_dmabuf_frame_v1::Event) {
-        use zwlr_export_dmabuf_frame_v1::Event as FrameEvent;
-        match event {
-            FrameEvent::Frame { .. } => self.frame.push_back(event),
-            FrameEvent::Object { .. } => {
-                self.objects.push_back(event);
-            }
-            FrameEvent::Ready { .. } => {
-                self.ready = Some(event);
-            }
-            FrameEvent::Cancel { .. } => {
-                self.frame.clear();
-                self.objects.clear();
-            }
-            _ => {}
-        }
-    }
-    fn do_capture(
-        mut self,
-        rx: Receiver<zwlr_export_dmabuf_frame_v1::Event>,
-    ) -> Result<(), Box<dyn Error>> {
-        use zwlr_export_dmabuf_frame_v1::Event;
-        let mut f = File::create("./capture.out")?;
-        let mut buf = Box::new([0u8; 1920 * 1080 * 10]);
-        while self.objects.len() > 0 {
-            if let Some(Event::Object { fd, .. }) = self.objects.pop_back() {
-                let mut reader: File = From::from(fd);
-                let reader_perms = Permissions::from_mode(7u32);
-                reader.set_permissions(reader_perms)?;
-
-                loop {
-                    let event_recieved = rx.try_recv();
-                    if let Ok(event) = event_recieved {
-                        if let Event::Cancel { reason } = event {
-                            dbg!("Capture Canceled: {}", reason);
-                            break;
-                        }
-                    }
-                    reader.read(&mut *buf)?;
-                    f.write_all(&*buf)?;
-                }
-            }
-        }
-        Ok(())
-    }
-    pub fn start_capture(self) -> Sender<zwlr_export_dmabuf_frame_v1::Event> {
-        let (tx, rx) = mpsc::channel();
-        let _ = thread::Builder::new()
-            .stack_size(1024 * 1024 * 100)
-            .spawn(|| self.do_capture(rx).expect("Failed to write"));
-        return tx;
-    }
-}
 
 #[derive(Debug, Default)]
 struct AppData {
     globals_list: Vec<Global>,
-    capturer: Option<Box<Capturer>>,
 }
 
 impl AppData {
@@ -178,32 +101,6 @@ impl Dispatch<ZwlrScreencopyManagerV1, ()> for AppData {
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
-    }
-}
-impl Dispatch<ZwlrExportDmabufFrameV1, ()> for AppData {
-    fn event(
-        state: &mut Self,
-        _: &ZwlrExportDmabufFrameV1,
-        event: zwlr_export_dmabuf_frame_v1::Event,
-        _: &(),
-        _: &Connection,
-        _qh: &QueueHandle<AppData>,
-    ) {
-        (|| -> Option<Sender<zwlr_export_dmabuf_frame_v1::Event>> {
-            println!("{:#?}", event);
-            if let None = state.capturer {
-                state.capturer = Some(Box::new(Capturer::default()))
-            }
-            let capture_data = state.capturer.as_mut().unwrap();
-            let is_ready_event = matches!(event, zwlr_export_dmabuf_frame_v1::Event::Ready { .. });
-            let _ = capture_data.insert(event);
-            if is_ready_event {
-                let tx = take(&mut state.capturer)?.start_capture();
-                Some(tx)
-            } else {
-                None
-            }
-        })();
     }
 }
 impl Dispatch<ZwlrScreencopyFrameV1, ()> for AppData {
