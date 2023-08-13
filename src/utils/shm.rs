@@ -56,7 +56,7 @@ impl ShmFactoryBuilder {
 #[allow(dead_code)]
 impl ShmFactory {
     /// Create a new [SharedMemMap](SharedMemMap) object with a static lifetime
-    pub fn create_shm_map(self) -> Option<SharedMemMap<'static>> {
+    pub fn create_shm_map<'a>(self) -> Option<SharedMemMap<'a>> {
         let runtime_dir = std::env::vars().find(|var| var.0 == "XDG_RUNTIME_DIR")?.1;
         let mut rd_path = PathBuf::from(&runtime_dir);
         if let Some(scope_val) = self.scope {
