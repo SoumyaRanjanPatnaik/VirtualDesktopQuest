@@ -11,10 +11,7 @@ use smithay_client_toolkit::{
 };
 use wayland_client::{
     globals::GlobalList,
-    protocol::{
-        wl_output::{self, WlOutput},
-        wl_shm::WlShm,
-    },
+    protocol::{wl_output, wl_shm::WlShm},
     Connection, Dispatch, QueueHandle,
 };
 
@@ -40,9 +37,9 @@ impl CapturerState {
             + ShmHandler
             + 'static,
     {
-        let mut output_state = OutputState::new(&global_list, qh);
-        let mut registry = RegistryState::new(&global_list);
-        let mut shm = Shm::bind(&global_list, qh)?;
+        let output_state = OutputState::new(&global_list, qh);
+        let registry = RegistryState::new(&global_list);
+        let shm = Shm::bind(&global_list, qh)?;
         Ok(Self {
             output_state,
             registry,
@@ -63,33 +60,23 @@ delegate_output!(CapturerState);
 impl OutputHandler for CapturerState {
     fn output_destroyed(
         &mut self,
-        conn: &Connection,
-        qh: &QueueHandle<Self>,
-        output: wl_output::WlOutput,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wl_output::WlOutput,
     ) {
     }
     fn update_output(
         &mut self,
-        conn: &Connection,
-        qh: &QueueHandle<Self>,
-        output: wl_output::WlOutput,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wl_output::WlOutput,
     ) {
-        let outputs_iter = self.output_state.outputs();
-        let updated_outputs: Vec<WlOutput> = outputs_iter
-            .map(|curr_output| {
-                if curr_output == output {
-                    output
-                } else {
-                    curr_output
-                }
-            })
-            .collect();
     }
     fn new_output(
         &mut self,
-        conn: &Connection,
-        qh: &QueueHandle<Self>,
-        output: wl_output::WlOutput,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wl_output::WlOutput,
     ) {
     }
     fn output_state(&mut self) -> &mut OutputState {

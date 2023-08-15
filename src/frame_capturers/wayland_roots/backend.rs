@@ -7,11 +7,11 @@ use wayland_client::{Connection, EventQueue};
 use super::state::CapturerState;
 
 pub struct WlrFrameCapturer {
-    state: CapturerState,
-    display: WlDisplay,
-    connection: Connection,
-    event_queue: EventQueue<CapturerState>,
-    global_list: GlobalList,
+    _state: CapturerState,
+    _display: WlDisplay,
+    _connection: Connection,
+    _event_queue: EventQueue<CapturerState>,
+    _global_list: GlobalList,
 }
 
 impl WlrFrameCapturer {
@@ -29,11 +29,11 @@ impl WlrFrameCapturer {
         // Initialize application state
         let state = CapturerState::new(&globals, &qh)?;
         Ok(Self {
-            global_list: globals,
-            connection,
-            event_queue,
-            display,
-            state,
+            _global_list: globals,
+            _connection: connection,
+            _event_queue: event_queue,
+            _display: display,
+            _state: state,
         })
     }
 }
