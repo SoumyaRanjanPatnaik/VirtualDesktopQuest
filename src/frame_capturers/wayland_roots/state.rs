@@ -1,13 +1,19 @@
-use std::{
-    error::Error,
-    io::{Stdin, Stdout},
-};
+use std::error::Error;
 
+use smithay_client_toolkit::{
+    delegate_output, delegate_registry, delegate_shm,
+    globals::GlobalData,
+    output::{OutputData, OutputHandler, OutputState},
+    reexports::protocols::xdg::xdg_output::zv1::client::{zxdg_output_manager_v1, zxdg_output_v1},
+    registry::{ProvidesRegistryState, RegistryState},
+    registry_handlers,
+    shm::{Shm, ShmHandler},
+};
 use wayland_client::{
-    globals::Global,
+    globals::GlobalList,
     protocol::{
         wl_output::{self, WlOutput},
-        wl_registry, wl_shm, wl_shm_pool,
+        wl_shm::WlShm,
     },
     Connection, Dispatch, QueueHandle,
 };
@@ -17,149 +23,87 @@ use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
 };
 
-use super::output_info::{OutputMetadataVariant, WlOutputMapping};
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct CapturerState {
-    pub outputs_old: Vec<WlOutput>,
-    pub outputs: Vec<Option<WlOutputMapping>>,
-    globals_list: Vec<Global>,
+    pub output_state: OutputState,
+    registry: RegistryState,
+    shm: Shm,
 }
 
 impl CapturerState {
-    /// Get info on globals that match the interface names
-    pub fn get_globals_by_interface_name<'a, 'b>(&self, interface: &str) -> Vec<Global> {
-        self.globals_list
-            .iter()
-            .filter(|global| global.interface == interface)
-            .map(|gobal_ref| gobal_ref.clone())
-            .collect()
-    }
-    pub fn get_global_by_interface_name<'a, 'b>(
-        &self,
-        interface: &str,
-    ) -> Result<Global, Box<dyn Error>> {
-        let global = self
-            .globals_list
-            .iter()
-            .filter(|global| global.interface == interface)
-            .map(|gobal_ref| gobal_ref.clone())
-            .nth(0)
-            .ok_or(format!("No global found with interface name: {interface}"))?;
-        Ok(global)
+    pub fn new<D>(global_list: &GlobalList, qh: &QueueHandle<D>) -> Result<Self, Box<dyn Error>>
+    where
+        D: Dispatch<wl_output::WlOutput, OutputData>
+            + Dispatch<zxdg_output_v1::ZxdgOutputV1, OutputData>
+            + Dispatch<zxdg_output_manager_v1::ZxdgOutputManagerV1, GlobalData>
+            + Dispatch<WlShm, GlobalData>
+            + ShmHandler
+            + 'static,
+    {
+        let mut output_state = OutputState::new(&global_list, qh);
+        let mut registry = RegistryState::new(&global_list);
+        let mut shm = Shm::bind(&global_list, qh)?;
+        Ok(Self {
+            output_state,
+            registry,
+            shm,
+        })
     }
 }
 
-impl Dispatch<wl_registry::WlRegistry, ()> for CapturerState {
-    fn event(
-        state: &mut Self,
-        _: &wl_registry::WlRegistry,
-        event: wl_registry::Event,
-        _: &(),
-        _: &Connection,
-        _qh: &QueueHandle<CapturerState>,
-    ) {
-        match event {
-            wl_registry::Event::Global {
-                name,
-                interface,
-                version,
-            } => {
-                state.globals_list.push(Global {
-                    name,
-                    interface,
-                    version,
-                });
-            }
-            wl_registry::Event::GlobalRemove { name } => {
-                let Some(index) = state
-                    .globals_list
-                    .iter()
-                    .position(|global| global.name == name) else {
-                    return;
-                };
-                state.globals_list.swap_remove(index);
-            }
-            _ => panic!("unknown event recieved when binding handling dispatch"),
-        }
+delegate_registry!(CapturerState);
+impl ProvidesRegistryState for CapturerState {
+    fn registry(&mut self) -> &mut RegistryState {
+        &mut self.registry
     }
+    registry_handlers!(OutputState);
 }
 
-impl Dispatch<wl_output::WlOutput, ((), usize)> for CapturerState {
-    fn event(
-        state: &mut Self,
-        wl_output: &wl_output::WlOutput,
-        event: wl_output::Event,
-        &(_, index): &((), usize),
-        _: &Connection,
-        _qh: &QueueHandle<CapturerState>,
-    ) {
-        let outputs = &mut state.outputs;
-        if index >= outputs.len() {
-            outputs.resize(index, None);
-        }
-        if outputs[index].is_none() {
-            outputs[index] = Some(WlOutputMapping::new(&wl_output));
-        }
-        let curr_output = outputs[index].as_mut().unwrap();
-        match event {
-            wl_output::Event::Name { name } => {
-                curr_output.metadata.to_partial();
-                match &mut curr_output.metadata {
-                    OutputMetadataVariant::Partial(meta) => meta.name = Some(name),
-                    OutputMetadataVariant::Complete(_) => (),
-                }
-            }
-            wl_output::Event::Mode {
-                width,
-                height,
-                refresh,
-                ..
-            } => {
-                curr_output.metadata.to_partial();
-                match &mut curr_output.metadata {
-                    OutputMetadataVariant::Partial(meta) => {
-                        meta.mode = Some((height, width, refresh))
-                    }
-                    OutputMetadataVariant::Complete(_) => (),
-                }
-            }
-
-            wl_output::Event::Description { description } => {
-                curr_output.metadata.to_partial();
-                match &mut curr_output.metadata {
-                    OutputMetadataVariant::Partial(meta) => meta.description = Some(description),
-                    OutputMetadataVariant::Complete(_) => (),
-                }
-            }
-            wl_output::Event::Scale { factor } => {
-                curr_output.metadata.to_partial();
-                match &mut curr_output.metadata {
-                    OutputMetadataVariant::Partial(meta) => meta.scale = Some(factor),
-                    OutputMetadataVariant::Complete(_) => (),
-                }
-            }
-            wl_output::Event::Done => {
-                if let Err(e) = curr_output.metadata.to_complete() {
-                    panic!("{}", e);
-                };
-                ()
-            }
-            _ => (),
-        }
-    }
-}
-
-impl Dispatch<wl_shm::WlShm, ()> for CapturerState {
-    fn event(
-        _state: &mut Self,
-        _proxy: &wl_shm::WlShm,
-        _event: <wl_shm::WlShm as wayland_client::Proxy>::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qhandle: &QueueHandle<Self>,
+delegate_output!(CapturerState);
+impl OutputHandler for CapturerState {
+    fn output_destroyed(
+        &mut self,
+        conn: &Connection,
+        qh: &QueueHandle<Self>,
+        output: wl_output::WlOutput,
     ) {
     }
+    fn update_output(
+        &mut self,
+        conn: &Connection,
+        qh: &QueueHandle<Self>,
+        output: wl_output::WlOutput,
+    ) {
+        let outputs_iter = self.output_state.outputs();
+        let updated_outputs: Vec<WlOutput> = outputs_iter
+            .map(|curr_output| {
+                if curr_output == output {
+                    output
+                } else {
+                    curr_output
+                }
+            })
+            .collect();
+    }
+    fn new_output(
+        &mut self,
+        conn: &Connection,
+        qh: &QueueHandle<Self>,
+        output: wl_output::WlOutput,
+    ) {
+    }
+    fn output_state(&mut self) -> &mut OutputState {
+        &mut self.output_state
+    }
 }
+
+delegate_shm!(CapturerState);
+impl ShmHandler for CapturerState {
+    fn shm_state(&mut self) -> &mut Shm {
+        &mut self.shm
+    }
+}
+
 impl Dispatch<ZwlrScreencopyManagerV1, ()> for CapturerState {
     fn event(
         _state: &mut Self,
@@ -181,17 +125,5 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for CapturerState {
         _qhandle: &QueueHandle<Self>,
     ) {
         // proxy.copy_with_damage()
-    }
-}
-
-impl Dispatch<wl_shm_pool::WlShmPool, ()> for CapturerState {
-    fn event(
-        _state: &mut Self,
-        _proxy: &wl_shm_pool::WlShmPool,
-        _event: <wl_shm_pool::WlShmPool as wayland_client::Proxy>::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qhandle: &QueueHandle<Self>,
-    ) {
     }
 }
