@@ -1,2 +1,1 @@
-mod app_data;
-mod manager;
+pub mod manager;

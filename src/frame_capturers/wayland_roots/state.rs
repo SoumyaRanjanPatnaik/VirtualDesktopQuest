@@ -1,4 +1,7 @@
-use std::error::Error;
+use std::{
+    error::Error,
+    io::{Stdin, Stdout},
+};
 
 use wayland_client::{
     globals::Global,
@@ -13,13 +16,16 @@ use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1,
     zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
 };
+
+use super::output_info::{OutputMetadataVariant, WlOutputMapping};
 #[derive(Debug, Default)]
-pub struct AppData {
-    pub outputs: Vec<WlOutput>,
+pub struct CapturerState {
+    pub outputs_old: Vec<WlOutput>,
+    pub outputs: Vec<Option<WlOutputMapping>>,
     globals_list: Vec<Global>,
 }
 
-impl AppData {
+impl CapturerState {
     /// Get info on globals that match the interface names
     pub fn get_globals_by_interface_name<'a, 'b>(&self, interface: &str) -> Vec<Global> {
         self.globals_list
@@ -43,14 +49,14 @@ impl AppData {
     }
 }
 
-impl Dispatch<wl_registry::WlRegistry, ()> for AppData {
+impl Dispatch<wl_registry::WlRegistry, ()> for CapturerState {
     fn event(
         state: &mut Self,
         _: &wl_registry::WlRegistry,
         event: wl_registry::Event,
         _: &(),
         _: &Connection,
-        _qh: &QueueHandle<AppData>,
+        _qh: &QueueHandle<CapturerState>,
     ) {
         match event {
             wl_registry::Event::Global {
@@ -78,23 +84,72 @@ impl Dispatch<wl_registry::WlRegistry, ()> for AppData {
     }
 }
 
-impl Dispatch<wl_output::WlOutput, ()> for AppData {
+impl Dispatch<wl_output::WlOutput, ((), usize)> for CapturerState {
     fn event(
-        _state: &mut Self,
-        _: &wl_output::WlOutput,
+        state: &mut Self,
+        wl_output: &wl_output::WlOutput,
         event: wl_output::Event,
-        _: &(),
+        &(_, index): &((), usize),
         _: &Connection,
-        _qh: &QueueHandle<AppData>,
+        _qh: &QueueHandle<CapturerState>,
     ) {
+        let outputs = &mut state.outputs;
+        if index >= outputs.len() {
+            outputs.resize(index, None);
+        }
+        if outputs[index].is_none() {
+            outputs[index] = Some(WlOutputMapping::new(&wl_output));
+        }
+        let curr_output = outputs[index].as_mut().unwrap();
         match event {
-            wl_output::Event::Name { name } => println!("{name}"),
+            wl_output::Event::Name { name } => {
+                curr_output.metadata.to_partial();
+                match &mut curr_output.metadata {
+                    OutputMetadataVariant::Partial(meta) => meta.name = Some(name),
+                    OutputMetadataVariant::Complete(_) => (),
+                }
+            }
+            wl_output::Event::Mode {
+                width,
+                height,
+                refresh,
+                ..
+            } => {
+                curr_output.metadata.to_partial();
+                match &mut curr_output.metadata {
+                    OutputMetadataVariant::Partial(meta) => {
+                        meta.mode = Some((height, width, refresh))
+                    }
+                    OutputMetadataVariant::Complete(_) => (),
+                }
+            }
+
+            wl_output::Event::Description { description } => {
+                curr_output.metadata.to_partial();
+                match &mut curr_output.metadata {
+                    OutputMetadataVariant::Partial(meta) => meta.description = Some(description),
+                    OutputMetadataVariant::Complete(_) => (),
+                }
+            }
+            wl_output::Event::Scale { factor } => {
+                curr_output.metadata.to_partial();
+                match &mut curr_output.metadata {
+                    OutputMetadataVariant::Partial(meta) => meta.scale = Some(factor),
+                    OutputMetadataVariant::Complete(_) => (),
+                }
+            }
+            wl_output::Event::Done => {
+                if let Err(e) = curr_output.metadata.to_complete() {
+                    panic!("{}", e);
+                };
+                ()
+            }
             _ => (),
         }
     }
 }
 
-impl Dispatch<wl_shm::WlShm, ()> for AppData {
+impl Dispatch<wl_shm::WlShm, ()> for CapturerState {
     fn event(
         _state: &mut Self,
         _proxy: &wl_shm::WlShm,
@@ -105,7 +160,7 @@ impl Dispatch<wl_shm::WlShm, ()> for AppData {
     ) {
     }
 }
-impl Dispatch<ZwlrScreencopyManagerV1, ()> for AppData {
+impl Dispatch<ZwlrScreencopyManagerV1, ()> for CapturerState {
     fn event(
         _state: &mut Self,
         _proxy: &ZwlrScreencopyManagerV1,
@@ -116,7 +171,7 @@ impl Dispatch<ZwlrScreencopyManagerV1, ()> for AppData {
     ) {
     }
 }
-impl Dispatch<ZwlrScreencopyFrameV1, ()> for AppData {
+impl Dispatch<ZwlrScreencopyFrameV1, ()> for CapturerState {
     fn event(
         _state: &mut Self,
         _proxy: &ZwlrScreencopyFrameV1,
@@ -129,7 +184,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for AppData {
     }
 }
 
-impl Dispatch<wl_shm_pool::WlShmPool, ()> for AppData {
+impl Dispatch<wl_shm_pool::WlShmPool, ()> for CapturerState {
     fn event(
         _state: &mut Self,
         _proxy: &wl_shm_pool::WlShmPool,

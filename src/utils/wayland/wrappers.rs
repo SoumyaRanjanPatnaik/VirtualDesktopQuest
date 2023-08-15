@@ -36,12 +36,16 @@ impl Registry {
     ) -> Vec<wl_output::WlOutput>
     where
         U: Clone + Send + Sync + 'static,
-        D: Dispatch<wl_output::WlOutput, U> + 'static,
+        D: Dispatch<wl_output::WlOutput, (U, usize)> + 'static,
     {
         let mut outputs = vec![];
-        for output_obj in output_globals {
-            let output: wl_output::WlOutput =
-                self.bind(output_obj.name, output_obj.version, &qh, udata.to_owned());
+        for (index, output_obj) in output_globals.iter().enumerate() {
+            let output: wl_output::WlOutput = self.bind(
+                output_obj.name,
+                output_obj.version,
+                &qh,
+                (udata.to_owned(), index),
+            );
             outputs.push(output);
         }
         outputs

@@ -3,6 +3,7 @@ mod frame_capturers;
 mod traits;
 mod utils;
 mod virtual_desktop;
+mod types;
 
 use std::error::Error;
 
