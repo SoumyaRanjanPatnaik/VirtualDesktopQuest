@@ -7,7 +7,7 @@ use crate::{
 const DISPLAY_BACKENDS: [&str; 1] = ["wayland_roots"];
 
 pub struct Manager {
-    _frame_capturer: Box<dyn FrameCaptureBackend>,
+    pub frame_capturer: Box<dyn FrameCaptureBackend>,
 }
 
 impl Manager {
@@ -23,8 +23,6 @@ impl Manager {
                 panic!("Unsupported session type type - {session_type}. Supported display backends are - {}", DISPLAY_BACKENDS.join(", "))
             }
         };
-        Ok(Manager {
-            _frame_capturer: frame_capturer,
-        })
+        Ok(Manager { frame_capturer })
     }
 }
