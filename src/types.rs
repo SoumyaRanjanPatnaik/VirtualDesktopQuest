@@ -1,7 +1,6 @@
-#[derive(Debug, Clone, Default)]
-pub struct OutputMetadata {
-    pub name: String,
-    pub description: Option<String>,
-    pub mode: (i32, i32, i32),
-    pub scale: i32,
+#[derive(Debug, Clone)]
+pub enum OutputIdentifier {
+    Name(String),
+    Description(String),
+    Metadata { make: String, model: String },
 }
