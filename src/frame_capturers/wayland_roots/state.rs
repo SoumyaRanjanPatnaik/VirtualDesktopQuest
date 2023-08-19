@@ -1,10 +1,10 @@
-use std::{collections::HashMap, error::Error, fs::File, io::Write};
+use std::{collections::HashMap, error::Error, fs::OpenOptions, slice};
 
-use drm_fourcc::DrmFourcc;
+use image::{ImageBuffer, ImageOutputFormat, Rgba};
 use smithay_client_toolkit::{
     delegate_output, delegate_registry, delegate_shm,
     globals::GlobalData,
-    output::{OutputData, OutputHandler, OutputInfo, OutputState},
+    output::{OutputData, OutputHandler, OutputState},
     reexports::protocols::xdg::xdg_output::zv1::client::{zxdg_output_manager_v1, zxdg_output_v1},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
@@ -13,7 +13,6 @@ use smithay_client_toolkit::{
 use wayland_client::{
     globals::GlobalList,
     protocol::{
-        wl_buffer::WlBuffer,
         wl_output::WlOutput,
         wl_shm::{Format, WlShm},
     },
@@ -30,8 +29,8 @@ pub struct CapturerState {
     output_state: OutputState,
     registry_state: RegistryState,
     shm: Shm,
-    capture_pool: MultiPool<WlOutput>,
-    output_buffers: HashMap<WlOutput, (i32, i32, i32, Format)>,
+    shm_pool: MultiPool<WlOutput>,
+    output_buffers: HashMap<WlOutput, (i32, i32, i32, Format, Option<(*const u8, usize)>)>,
 }
 
 impl CapturerState {
@@ -53,7 +52,7 @@ impl CapturerState {
             output_state,
             registry_state,
             shm,
-            capture_pool,
+            shm_pool: capture_pool,
             output_buffers,
         })
     }
@@ -109,19 +108,41 @@ impl Dispatch<ZwlrScreencopyFrameV1, WlOutput> for CapturerState {
         use zwlr_screencopy_frame_v1::Event;
         match event {
             Event::Ready { .. } => {
-                let Some(&(width, stride, height, fmt)) = state.output_buffers.get(output) else {
+                let Some(&(width,_string, height, fmt , Some((buff_ptr, buff_size)))) = state.output_buffers.get(output)else {
                     dbg!("Failed to get buffer parameters for display");
                     return;
                 };
-                let Some((.., buff)) = state.capture_pool.get(width, stride, height, output, fmt) else {
-                    dbg!("Failed to get / allocate new buffer");
-                    return;
-                };
-                let Ok(mut file) = File::open("./capture.out") else {
+                let file_result = OpenOptions::new()
+                    .write(true)
+                    .read(true)
+                    .create(true)
+                    .open("./capture.png");
+                let Ok(mut file) = file_result else {
                     dbg!("Falied to write");
                     return;
                 };
-                let _ = file.write_all(buff);
+                let buff: Vec<u8> = unsafe {
+                    slice::from_raw_parts(buff_ptr, buff_size)
+                        .chunks(4)
+                        .flat_map(|pixel| match fmt {
+                            Format::Xbgr8888 => [pixel[0], pixel[1], pixel[2], pixel[3]],
+                            Format::Argb8888 => [pixel[1], pixel[2], pixel[3], pixel[0]],
+                            _ => {
+                                dbg!(fmt);
+                                panic!("Unsupported format");
+                            }
+                        })
+                        .collect()
+                };
+                let framebuffer: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_raw(
+                    width.try_into().unwrap(),
+                    height.try_into().unwrap(),
+                    buff,
+                )
+                .unwrap();
+                framebuffer
+                    .write_to(&mut file, ImageOutputFormat::Png)
+                    .expect("Failed to write image");
             }
             Event::Buffer {
                 format,
@@ -137,36 +158,18 @@ impl Dispatch<ZwlrScreencopyFrameV1, WlOutput> for CapturerState {
                     );
                     state
                         .output_buffers
-                        .insert(output.clone(), (width, stride, height, fmt));
+                        .insert(output.clone(), (width, stride, height, fmt, None));
                 }
                 _ => (),
             },
-            Event::LinuxDmabuf {
-                format,
-                width,
-                height,
-            } => {
-                let (width, height, stride) =
-                    (width.try_into().unwrap(), height.try_into().unwrap(), 0);
-                if let Ok(drm_format) = DrmFourcc::try_from(format) {
-                    let format = match drm_format {
-                        DrmFourcc::Xrgb8888 => Format::Xrgb8888,
-                        DrmFourcc::Argb8888 => Format::Argb8888,
-                        _ => return,
-                    };
-
-                    state
-                        .output_buffers
-                        .insert(output.clone(), (width, stride, height, format));
-                };
-            }
             Event::BufferDone => {
-                let Some(&(width, stride, height, fmt)) = state.output_buffers.get(output) else {
+                let Some(mut buff_meta) = state.output_buffers.remove(output) else {
                     dbg!("Failed to get buffer parameters for display");
                     return;
                 };
+                let &(width, stride, height, fmt, ..) = &buff_meta;
                 let buff_create_result = state
-                    .capture_pool
+                    .shm_pool
                     .create_buffer(width, stride, height, output, fmt);
                 let buff_info = match buff_create_result {
                     Ok(buff_info) => buff_info,
@@ -175,6 +178,9 @@ impl Dispatch<ZwlrScreencopyFrameV1, WlOutput> for CapturerState {
                         return;
                     }
                 };
+                let buff_contents = buff_info.2;
+                buff_meta.4 = Some((buff_contents.as_ptr(), buff_contents.len()));
+                state.output_buffers.insert(output.clone(), buff_meta);
                 proxy.copy(buff_info.1);
                 let _ = conn.flush();
                 let _ = conn.roundtrip();
