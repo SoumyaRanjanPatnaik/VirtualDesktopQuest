@@ -15,7 +15,6 @@ use super::state::CapturerState;
 pub struct WlrFrameCapturer {
     state: CapturerState,
     _display: WlDisplay,
-    connection: Connection,
     event_queue: EventQueue<CapturerState>,
     global_list: GlobalList,
 }
@@ -38,7 +37,6 @@ impl WlrFrameCapturer {
         event_queue.roundtrip(&mut state)?;
         Ok(Self {
             global_list,
-            connection,
             event_queue,
             _display: display,
             state,
